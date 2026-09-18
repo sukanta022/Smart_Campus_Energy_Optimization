@@ -1,0 +1,13 @@
+{
+  "name": "gridwise-load-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "k6 load test for /optimize-energy. Run with `k6 run tests/load/k6_optimize.js`.",
+  "scripts": {
+    "smoke": "k6 run -e BASE_URL=http://localhost:8080 --duration 30s --vus 10 tests/load/k6_optimize.js",
+    "peak":  "k6 run -e BASE_URL=$BASE_URL tests/load/k6_optimize.js"
+  },
+  "devDependencies": {
+    "k6": ">=0.49.0"
+  }
+}

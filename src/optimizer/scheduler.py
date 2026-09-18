@@ -144,12 +144,38 @@ def optimize_schedule(
             max_discharge_kwh_per_hour=max_discharge_kwh_per_hour,
             effective=effective,
         )
+
+        def _clamp(value: float, low: float, up: float) -> float:
+            """Clamp a warm-start value into [low, up]. PuLP's setInitialValue
+            raises ValueError on out-of-bound hints, so we cap defensively here
+            (the heuristic may slightly over-allocate during the end-of-day
+            neutrality correction)."""
+            return max(low, min(value, up))
+
+        charge_bounds = [
+            max_charge_kwh_per_hour if effective.charge_allowed[h] else 0.0 for h in H
+        ]
+        discharge_bounds = [
+            max_discharge_kwh_per_hour if effective.discharge_allowed[h] else 0.0
+            for h in H
+        ]
+
         for h in H:
-            grid[h].setInitialValue(warm["grid"][h])
-            solar_used[h].setInitialValue(warm["solar_used"][h])
-            charge[h].setInitialValue(warm["charge"][h])
-            discharge[h].setInitialValue(warm["discharge"][h])
-            e_after[h].setInitialValue(warm["e_after"][h])
+            grid[h].setInitialValue(_clamp(warm["grid"][h], 0.0, float("inf")))
+            solar_used[h].setInitialValue(
+                _clamp(warm["solar_used"][h], 0.0, effective.effective_solar[h])
+            )
+            charge[h].setInitialValue(_clamp(warm["charge"][h], 0.0, charge_bounds[h]))
+            discharge[h].setInitialValue(
+                _clamp(warm["discharge"][h], 0.0, discharge_bounds[h])
+            )
+            e_after[h].setInitialValue(
+                _clamp(
+                    warm["e_after"][h],
+                    effective.effective_min_reserve[h],
+                    capacity_kwh,
+                )
+            )
 
     # ---- Solve -----------------------------------------------------------
     solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_seconds)
@@ -272,26 +298,14 @@ def _greedy_warm_start(
                 e += c
         e_after[h] = e
 
-    # Enforce end-of-day neutrality in the warm-start by scaling battery action.
-    delta = e - initial_energy_kwh
-    if abs(delta) > 1e-6:
-        # Find cheapest hour to charge (-delta) or discharge (+delta) and adjust.
-        target_delta = -delta  # if delta > 0 we over-stored, need to discharge
-        if target_delta > 0:
-            # discharge in cheapest hour
-            idx = min(range(n), key=lambda h: tariff[h])
-            d = min(max_discharge_kwh_per_hour, target_delta, e_after[idx] - effective.effective_min_reserve[idx])
-            discharge[idx] += d
-            # adjust downstream state
-            for h in range(idx, n):
-                e_after[h] -= d
-        else:
-            need = -target_delta
-            idx = max(range(n), key=lambda h: tariff[h])
-            c = min(max_charge_kwh_per_hour, need, capacity_kwh - e_after[idx])
-            charge[idx] += c
-            for h in range(idx, n):
-                e_after[h] += c
+    # Note: We deliberately do NOT add an end-of-day neutrality correction
+    # to the warm-start. The greedy forward loop above already guarantees a
+    # feasible, bound-respecting hint (battery SoC stays in
+    # [min_reserve, capacity] and per-hour discharge/charge respects the
+    # rate limits). An extra correction would either violate those bounds
+    # or leave downstream e_after values inconsistent with the corrected
+    # discharge at the index hour. PuLP's simplex will find the true
+    # optimum regardless of whether the warm-start is end-of-day neutral.
 
     return {
         "grid": grid,

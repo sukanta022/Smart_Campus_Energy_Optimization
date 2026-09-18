@@ -1,1 +1,199 @@
-# Smart_Campus_Energy_Optimization
+# GridWise — LLM-Driven Campus Energy Optimizer
+
+A production-shaped service that takes natural-language energy directives (e.g. *"derate solar by 25% on cloudy days and cap grid imports at 3.5 kWh between 5–10 pm"*), interprets them with an LLM, and produces an hour-by-hour 24-hour plan that respects physics, tariffs, and battery constraints.
+
+Built for the BUP CSE FEST 2026 preliminary round.
+
+---
+
+## Why this exists
+
+Smart-campus energy systems need to react to instructions written by humans — operators, building managers, finance teams. Those instructions are messy: ambiguous units, half-open windows, distractors, contradictions. A naive regex parser misses too much; a raw LLM call hallucinates units and ignores constraints. This service splits the problem in two:
+
+| Stage | Responsibility | Failure mode |
+|-------|----------------|--------------|
+| **LLM (OpenAI gpt-4o-mini)** | Convert English → typed JSON directives | Hallucinated units / out-of-range numbers |
+| **Validator (deterministic)** | Clamp, range-check, drop invalid entries | Safe-fail each entry to `no_op` |
+| **Optimizer (PuLP)** | Solve the 24-hour LP under all hard constraints | Infeasibility → 500 (operator should see) |
+| **Replay (deterministic)** | Re-derive the response from inputs and assert equality | Catches drift between model + code |
+
+The LLM never sees physics. Physics never sees English. Each layer can be unit-tested in isolation.
+
+---
+
+## Quickstart
+
+```bash
+# 1. Install
+python -m pip install -e ".[dev]"
+
+# 2. Run locally (the validator + optimizer work without an API key;
+#    the LLM path activates when OPENAI_API_KEY is set)
+export PYTHONPATH=src
+export OPENAI_API_KEY=${OPENAI_API_KEY:-test}
+export GRIDWISE_ENABLE_FALLBACK_PARSER=true
+python -m uvicorn app.main:app --port 8080
+
+# 3. Probe
+curl -s http://localhost:8080/health
+curl -s http://localhost:8080/metrics | head
+
+# 4. POST a scenario
+curl -s -X POST http://localhost:8080/optimize-energy \
+  -H 'Content-Type: application/json' \
+  -d @tests/fixtures/scenario_01_clear_sky.json | jq .
+```
+
+A full scenario fixture is at `tests/fixtures/scenario_01_clear_sky.json`.
+
+---
+
+## API
+
+### `GET /health`
+
+Returns `{"status":"ok"}` once the orchestrator is wired. Returns 503 during the first 2 s after process start.
+
+### `POST /optimize-energy`
+
+Accepts a PRD §07 request body, returns a PRD §10 response body. See `src/app/models.py` for the canonical types.
+
+### `GET /metrics`
+
+Prometheus exposition. Custom series:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `gridwise_llm_latency_seconds` | Histogram | `outcome={ok,error,breaker_open}` |
+| `gridwise_optimizer_latency_seconds` | Histogram | `status={ok,error}` |
+| `gridwise_judge_replay_failures_total` | Counter | — |
+| `gridwise_directive_validation_failures_total` | Counter | `directive_type` |
+| `gridwise_requests_total` | Counter | `outcome={ok,400,500,429}` |
+| `gridwise_llm_in_use` | Gauge | — |
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         Client                                   │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ POST /optimize-energy
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  FastAPI (uvicorn, single worker per task)                       │
+│                                                                  │
+│  ┌────────────┐   ┌──────────────┐   ┌──────────────┐            │
+│  │ RateLimit  │ → │ Orchestrator │ → │ Replay check │ → 200/500  │
+│  └────────────┘   └──────┬───────┘   └──────────────┘            │
+│                          │                                       │
+│                ┌─────────┴──────────┐                            │
+│                ▼                    ▼                            │
+│         ┌─────────────┐    ┌──────────────────┐                  │
+│         │ LLM path    │    │ Fallback (regex) │                  │
+│         │ gpt-4o-mini │    │ deterministic    │                  │
+│         └─────┬───────┘    └────────┬─────────┘                  │
+│               │                     │                            │
+│               ▼                     ▼                            │
+│         ┌─────────────────────────────────────┐                  │
+│         │ Validator (§08 guardrails)          │                  │
+│         └────────────────┬────────────────────┘                  │
+│                          ▼                                       │
+│         ┌─────────────────────────────────────┐                  │
+│         │ Directive applicator (effective[])  │                  │
+│         └────────────────┬────────────────────┘                  │
+│                          ▼                                       │
+│         ┌─────────────────────────────────────┐                  │
+│         │ PuLP LP (24-hour, end-of-day ≡ SoC) │                  │
+│         └─────────────────────────────────────┘                  │
+└──────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  AWS: ECS Fargate → ALB → WAF v2 → ElastiCache Redis (rate)     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Repo layout
+
+```
+src/
+  app/             FastAPI service + cross-cutting concerns
+    main.py            HTTP entrypoint, exception handlers, lifespan
+    orchestrator.py    End-to-end pipeline
+    config.py          Settings (env-driven)
+    metrics.py         Prometheus registry
+    logging_setup.py   structlog JSON
+    resilience.py      Rate limit + circuit breaker + fallback wiring
+    replay.py          §11.3 consistency checks
+    models.py          Pydantic schemas (PRD §07/§10)
+  llm/             LLM interpretation layer
+    prompts/system.txt    System prompt
+    schema.py             response_format json_schema
+    interpreter.py        AsyncOpenAI client (temperature=0, seed=42)
+    validator.py          §08 guardrails, safe-fail to no_op
+    fallback.py           Regex parser (used when LLM circuit is open)
+  optimizer/       Deterministic planning layer
+    directives.py         Apply directives → EffectiveArrays
+    scheduler.py          PuLP LP + warm-start + response builder
+infra/             Terraform IaC (VPC/ALB/ECS/Redis/ECR/Secrets/WAF)
+.github/workflows/ CI + CD
+tests/
+  unit/            Per-module unit tests
+  integration/     End-to-end FastAPI tests
+  load/            k6 scenarios (1k RPS / 10 min)
+  fixtures/        JSON scenarios (PRD §07 shape)
+Dockerfile         Multi-stage python:3.12-slim image
+```
+
+---
+
+## Development
+
+```bash
+# Run tests
+pytest tests/unit tests/integration -v
+
+# Lint + format
+ruff check src tests
+ruff format src tests
+
+# Type check
+mypy src --strict
+
+# Load test (requires k6 + a running service)
+k6 run -e BASE_URL=http://localhost:8080 tests/load/k6_optimize.js
+```
+
+---
+
+## Deployment
+
+See `RUNBOOK.md` for deploy/rollback/on-call.
+
+```bash
+# Apply Terraform (one-time per env)
+cd infra
+terraform init -backend-config=backend.hcl
+terraform apply
+
+# Push an image and rolling-deploy
+git tag v0.1.0 && git push --tags   # triggers .github/workflows/deploy.yml
+```
+
+---
+
+## Safety guarantees
+
+The PRD §08 guardrails are *not* LLM prompt suggestions — they are enforced in `src/llm/validator.py`. Any directive the LLM emits that fails range, type, or shape checks is replaced with a `no_op` (`applies=false`, `structured_adjustment=null`). This means the optimizer always sees a well-typed input even when the LLM misbehaves.
+
+The replay checker (`src/app/replay.py`) re-derives the response from the request and the directive list after the optimizer runs, asserting equality within `TOLERANCE_KWH = 0.01`. If a model update or optimizer change would silently break invariants, the service returns 500 instead of shipping a wrong answer.
+
+---
+
+## License
+
+Built for BUP CSE FEST 2026.

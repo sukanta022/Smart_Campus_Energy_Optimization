@@ -91,8 +91,10 @@ async def with_fallback(
         result = await breaker.call_async(primary)
         return result, "primary"
     except pybreaker.CircuitBreakerError as e:
-        logger.warning("circuit open for %s: %s", label, e)
+        logger.warning("circuit open for %s: %s", label, e, exc_info=True)
     except Exception as e:  # noqa: BLE001
-        logger.warning("primary %s failed: %s", label, e)
+        logger.warning(
+            "primary %s failed: %s", label, e, exc_info=True,
+        )
     result = await fallback()
     return result, "fallback"

@@ -1,0 +1,208 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (prod|staging)"
+        required: true
+        default: prod
+        type: choice
+        options: [prod, staging]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  AWS_REGION: ap-southeast-1
+  PROJECT: gridwise
+  ECS_CLUSTER: gridwise-prod
+  ECS_SERVICE: gridwise-prod
+  CONTAINER_NAME: gridwise
+  CONTAINER_PORT: "8080"
+  # The role ARN below is a PLACEHOLDER. Operators must set the real value
+  # via Settings → Secrets and variables → Actions → Variables, then reference
+  # it from this env block. The matching role is created by infra/iam.tf.
+  TF_IAM_ROLE_ARN: arn:aws:iam::ACCOUNT_ID:role/gridwise-prod-gha-deploy
+  # operator-supplied via `vars/...` in GitHub Actions — see secrets.tfvars below.
+
+# Default token permissions for all jobs. Per-job overrides below.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve deploy metadata
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      ecr_repository: ${{ steps.meta.outputs.ecr_repository }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            IS_RELEASE=true
+          else
+            TAG="${SHA::7}"
+            IS_RELEASE=false
+          fi
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=${{ env.PROJECT }}" >> "$GITHUB_OUTPUT"
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHA::7}" >> "$GITHUB_OUTPUT"
+
+  # ---------- Build & push image ----------
+
+  build-push:
+    name: build + scan + push
+    runs-on: ubuntu-latest
+    needs: resolve
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+      image_digest: ${{ steps.push.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.TF_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT }}:${{ needs.resolve.outputs.image_tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT }}:${{ needs.resolve.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT }}:${{ needs.resolve.outputs.image_tag }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload image scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Capture resolved digest
+        id: push
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT }}:${{ needs.resolve.outputs.image_tag }})
+          echo "image_uri=${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT }}@${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+
+  # ---------- ECS rolling deploy ----------
+
+  deploy-ecs:
+    name: deploy ECS service
+    runs-on: ubuntu-latest
+    needs: [build-push]
+    environment:
+      name: ${{ github.event.inputs.environment || 'prod' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.TF_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query taskDefinition > task-def.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > task-def-clean.json
+
+      - name: Render new task definition with resolved image
+        id: render
+        run: |
+          jq --arg IMAGE "${{ needs.build-push.outputs.image_uri }}" \
+            --arg CONTAINER_NAME "${{ env.CONTAINER_NAME }}" \
+            '.containerDefinitions |= map(if .name == $CONTAINER_NAME then .image = $IMAGE else . end)' \
+            task-def-clean.json > task-def-new.json
+          cat task-def-new.json | head -40
+
+      - name: Register new task definition
+        id: register
+        run: |
+          REV=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def-new.json \
+            --query 'taskDefinition.revision' --output text)
+          echo "task_def_revision=$REV" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service (rolling deploy)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ env.ECS_SERVICE }}:${{ steps.register.outputs.task_def_revision }} \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+      - name: Smoke test /health
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names ${{ env.ECS_SERVICE }} \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          for i in 1 2 3 4 5; do
+            sleep 10
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${ALB_DNS}/health" || echo 000)
+            echo "attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then exit 0; fi
+          done
+          echo "health check failed after 5 attempts" >&2
+          exit 1
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Deployed ${{ needs.build-push.outputs.image_uri }} to ${{ env.ECS_SERVICE }}"

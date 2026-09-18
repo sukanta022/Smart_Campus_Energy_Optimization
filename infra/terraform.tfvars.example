@@ -1,0 +1,32 @@
+# Defaults are baked into variables.tf — only override what changes per env.
+
+project     = "gridwise"
+environment = "prod"
+owner       = "sukanta022"
+region      = "ap-southeast-1"
+
+# Pin to a digest in prod. CI/CD writes the resolved image URI here.
+container_image = ""
+
+# Provide an existing secret ARN to avoid re-creating one. When empty,
+# secrets.tf creates aws_secretsmanager_secret.openai_api_key and you
+# must populate it via:
+#   aws secretsmanager put-secret-value \
+#     --secret-id gridwise/prod/openai-api-key \
+#     --secret-string "$OPENAI_API_KEY"
+openai_api_key_secret_arn = ""
+
+# Domain + ACM cert. Leave empty to terminate on HTTP only (dev/staging).
+domain_name     = ""
+certificate_arn = ""
+
+# In prod, restrict to operator CIDRs.
+allowed_cidrs = ["0.0.0.0/0"]
+
+task_cpu              = 1024
+task_memory           = 2048
+task_desired_count    = 3
+task_min_count        = 3
+task_max_count        = 100
+rate_limit_per_minute = 600
+redis_node_type       = "cache.t4g.small"

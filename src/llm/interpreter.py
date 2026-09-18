@@ -60,7 +60,13 @@ def load_system_prompt() -> str:
 
 
 class LLMInterpreter:
-    """Async wrapper around the OpenAI chat.completions endpoint."""
+    """Async wrapper around the OpenAI chat.completions endpoint.
+
+    The underlying ``AsyncOpenAI`` client is constructed lazily on the first
+    ``interpret()`` call. This keeps the service bootable in environments
+    without ``OPENAI_API_KEY`` (so the deterministic fallback parser path
+    works) and avoids opening a credential socket during process startup.
+    """
 
     def __init__(self, config: LLMConfig | None = None, *, client: AsyncOpenAI | None = None) -> None:
         self._config = config or LLMConfig()
@@ -69,11 +75,30 @@ class LLMInterpreter:
 
         self._response_format = build_response_format()
         self._system_prompt = load_system_prompt()
-        self._client = client or AsyncOpenAI(
+        # ``_client`` is built on first use so a missing API key only fails
+        # when we actually try to talk to OpenAI. Caller code in the
+        # orchestrator already handles that case by switching to the
+        # deterministic regex fallback parser.
+        self._client: AsyncOpenAI | None = client
+        self._client_locked = client is not None
+
+    def _get_client(self) -> AsyncOpenAI:
+        """Return the OpenAI client, constructing it on first access."""
+        if self._client is not None:
+            return self._client
+        if not self._config.api_key:
+            raise InterpreterError(
+                "OPENAI_API_KEY is not configured; cannot construct the OpenAI client. "
+                "Either set the OPENAI_API_KEY environment variable or enable "
+                "GRIDWISE_ENABLE_FALLBACK_PARSER=true to use the deterministic regex parser."
+            )
+        self._client = AsyncOpenAI(
             api_key=self._config.api_key,
             timeout=httpx.Timeout(self._config.timeout_seconds),
             max_retries=0,  # we drive retries ourselves for visibility
         )
+        self._client_locked = True
+        return self._client
 
     async def interpret(self, request: OptimizeRequest) -> list[DirectiveInterpretation]:
         """Interpret every operator note and return one DirectiveInterpretation per note."""
@@ -106,6 +131,7 @@ class LLMInterpreter:
 
     async def _call_chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """Issue the chat completion with bounded retries."""
+        client = self._get_client()  # may raise InterpreterError on missing key
         attempt = 0
         try:
             async for attempt_ctx in AsyncRetrying(
@@ -116,7 +142,7 @@ class LLMInterpreter:
             ):
                 with attempt_ctx:
                     attempt += 1
-                    response = await self._client.chat.completions.create(
+                    response = await client.chat.completions.create(
                         model=self._config.model,
                         messages=messages,
                         temperature=0,

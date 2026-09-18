@@ -1,0 +1,7 @@
+# Copy to backend.hcl, fill in, then:
+#   terraform init -backend-config=backend.hcl
+bucket         = "gridwise-tf-state-ap-southeast-1"
+key            = "prod/terraform.tfstate"
+region         = "ap-southeast-1"
+dynamodb_table = "gridwise-tf-locks"
+encrypt        = true
