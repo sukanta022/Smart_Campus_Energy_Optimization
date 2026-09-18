@@ -16,7 +16,9 @@ RUN apt-get update \
 WORKDIR /app
 
 # Install dependencies into a prefix we copy into the runtime stage.
-COPY pyproject.toml ./
+# README.md is referenced by pyproject.toml (readme = "README.md") so it must
+# be present at metadata-generation time.
+COPY pyproject.toml README.md ./
 COPY src ./src
 
 # Use pip's "install --prefix" into /install then copy the prefix into runtime.
