@@ -36,7 +36,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     PORT=8080 \
     GRIDWISE_WORKERS=1 \
-    GRIDWISE_LOG_LEVEL=INFO
+    GRIDWISE_LOG_LEVEL=info
 
 # Minimal runtime system packages: tini for signal handling, curl for healthcheck.
 RUN apt-get update \
