@@ -22,7 +22,6 @@ build
 .DS_Store
 infra/.terraform
 infra/*.tfstate*
-README.md
 RUNBOOK.md
 SUBMISSION.md
 tests/load
